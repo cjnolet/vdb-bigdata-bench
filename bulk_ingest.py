@@ -40,27 +40,27 @@ if __name__ == "__main__":
     data_minio_path = dataset_name + "_npy_data/"
     print(data_minio_path)
 
-    n_rows = 50000000
+    n_rows = 667000000
     batch_size = 50000000
     dim = 1024
     n_centers = 1024
-    n_parts = 100
+    n_parts = 30
     n_batches = np.ceil(n_rows / batch_size)
 
-    # cluster = LocalCUDACluster(threads_per_worker=1)
-    # client = Client(cluster)
-    # workers = list(client.scheduler_info()['workers'].keys())
+    cluster = LocalCUDACluster(threads_per_worker=1)
+    client = Client(cluster)
+    workers = list(client.scheduler_info()['workers'].keys())
 
-    # for batch in range(int(n_batches)):
-    #     adjusted_batch_size = min(batch_size, n_rows - batch * batch_size)
-    #     if batch == 0:
-    #         X, y, centers = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=n_centers, return_centers = True, workers = workers, n_parts = n_parts)            
-    #     else:
-    #         X, y = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=centers, workers = workers, n_parts = n_parts)
-    #     to_npy_stack(data_minio_path + str(batch), X, axis=0)
+    for batch in range(int(n_batches)):
+        adjusted_batch_size = min(batch_size, n_rows - batch * batch_size)
+        if batch == 0:
+            X, y, centers = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=n_centers, return_centers = True, workers = workers, n_parts = n_parts)            
+        else:
+            X, y = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=centers, workers = workers, n_parts = n_parts)
+        to_npy_stack(data_minio_path + str(batch), X, axis=0)
 
-    # client.close()
-    # cluster.close()
+    client.close()
+    cluster.close()
 
     connections.connect(host="localhost", port=19530)
 
@@ -175,7 +175,6 @@ if __name__ == "__main__":
         raise e from None
 
     def wait_index():
-        task = utility.get_bulk_insert_state(task_id=task_id)
         while True:
             progress = utility.index_building_progress(collection_name)
             print(progress)
