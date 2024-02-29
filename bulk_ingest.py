@@ -4,7 +4,7 @@ from dask_cuda import LocalCUDACluster
 from dask.distributed import Client
 from cuml.dask.datasets import make_blobs
 from dask.array import to_npy_stack
-
+import cuml
 import time
 import struct
 import numpy as np
@@ -15,8 +15,12 @@ import time
 import os
 import shutil
 
+from dask import dataframe as dd
+import dask.array as da
 from minio import Minio
 from minio.error import S3Error
+import dask
+import dask_cudf
 
 import environs
 
@@ -36,30 +40,29 @@ if __name__ == "__main__":
     data_minio_path = dataset_name + "_npy_data/"
     print(data_minio_path)
 
-    n_rows = 635780000
+    n_rows = 50000000
     batch_size = 50000000
     dim = 1024
     n_centers = 1024
-    n_chunks = 30
+    n_parts = 100
     n_batches = np.ceil(n_rows / batch_size)
 
-    cluster = LocalCUDACluster(threads_per_worker=1)
-    client = Client(cluster)
-    workers = list(client.scheduler_info()['workers'].keys())
+    # cluster = LocalCUDACluster(threads_per_worker=1)
+    # client = Client(cluster)
+    # workers = list(client.scheduler_info()['workers'].keys())
 
-    for batch in range(int(n_batches)):
-        adjusted_batch_size = min(batch_size, n_rows - batch * batch_size)
-        if batch == 0:
-            X, y, centers = make_blobs(adjusted_batch_size, dim, centers=n_centers, workers=workers, n_parts = n_chunks, return_centers = True)
-        else:
-            X, y = make_blobs(adjusted_batch_size, dim, centers=centers, workers=workers, n_parts = n_chunks)
-        to_npy_stack(data_minio_path + '/' + str(batch), X, axis=0)
+    # for batch in range(int(n_batches)):
+    #     adjusted_batch_size = min(batch_size, n_rows - batch * batch_size)
+    #     if batch == 0:
+    #         X, y, centers = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=n_centers, return_centers = True, workers = workers, n_parts = n_parts)            
+    #     else:
+    #         X, y = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=centers, workers = workers, n_parts = n_parts)
+    #     to_npy_stack(data_minio_path + str(batch), X, axis=0)
 
-    client.close()
-    cluster.close()
+    # client.close()
+    # cluster.close()
 
     connections.connect(host="localhost", port=19530)
-    print("connected swuccess")
 
     def upload(data_folder: str,
             bucket_name: str=DEFAULT_BUCKET_NAME)->(bool, list):
@@ -68,6 +71,7 @@ if __name__ == "__main__":
             return False, []
 
         remote_files = []
+
         try:
             print("Prepare upload files")
             minio_client = Minio(endpoint=MINIO_ADDRESS, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=False)
@@ -77,17 +81,18 @@ if __name__ == "__main__":
                 return False, []
 
             remote_data_path = "milvus_bulkinsert"
+
             def upload_files(folder:str):
                 for parent, dirnames, filenames in os.walk(folder):
-                    print(parent, dirnames, filenames)
                     if parent is folder:
-                        chunk = 0
                         for filename in filenames:
                             ext = os.path.splitext(filename)
                             if len(ext) != 2 or (ext[1] != ".json" and ext[1] != ".npy"):
                                 continue
                             local_full_path = os.path.join(parent, filename)
-                            minio_file_path = os.path.join(remote_data_path, os.path.basename(folder), filename)
+                            dir = os.path.basename(folder)
+                            idx = str(int(dir) * n_parts + int(ext[0]))
+                            minio_file_path = os.path.join(remote_data_path, idx, "base.npy")
                             minio_client.fput_object(bucket_name, minio_file_path, local_full_path)
                             print("Upload file '{}' to '{}'".format(local_full_path, minio_file_path))
                             remote_files.append(minio_file_path)
@@ -113,21 +118,38 @@ if __name__ == "__main__":
         collection.drop()
         print("drop")
     print("create collection")
-
-    coll = Collection(collection_name)
+    fields = [
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+        FieldSchema(name="base", dtype=DataType.FLOAT_VECTOR, dim=dim)
+    ]
+    schema = CollectionSchema(fields)
+    coll = Collection(collection_name, schema)
 
     begin_t = time.time()
     ok, remote_files = upload(data_folder=data_minio_path)
 
+    print(remote_files)
+
     print("do_bulk_insert")
-    task_id = utility.do_bulk_insert(
-        collection_name=collection_name,
-        files=remote_files)
+    for remote_file in remote_files:
+        print(remote_file)
+        task_id = utility.do_bulk_insert(
+            collection_name=collection_name,
+            files=[remote_file])
 
     print("wait insert")
     while True:
         task = utility.get_bulk_insert_state(task_id=task_id)
         print("Task state:", task.state_name)
+        print("Imported files:", task.files)
+        print("Collection name:", task.collection_name)
+        print("Partition name:", task.partition_name)
+        print("Start time:", task.create_time_str)
+        print("Imported row count:", task.row_count)
+        print("Entities ID array generated by this task:", task.ids)
+        print("Task failed reason", task.failed_reason)
+
+        print(coll.num_entities)
 
         if coll.num_entities == n_rows:
             coll.flush()
@@ -153,6 +175,7 @@ if __name__ == "__main__":
         raise e from None
 
     def wait_index():
+        task = utility.get_bulk_insert_state(task_id=task_id)
         while True:
             progress = utility.index_building_progress(collection_name)
             print(progress)
