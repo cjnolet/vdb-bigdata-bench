@@ -3,7 +3,7 @@ from pymilvus import CollectionSchema, FieldSchema, DataType, utility, connectio
 from dask_cuda import LocalCUDACluster
 from dask.distributed import Client
 from cuml.dask.datasets import make_blobs
-from dask.array import to_npy_stack
+from dask.array import transpose, to_npy_stack
 import cuml
 import time
 import struct
@@ -20,10 +20,9 @@ import dask.array as da
 from minio import Minio
 from minio.error import S3Error
 import dask
-import dask_cudf
 
 import environs
-
+import cupy
 collection_name = "VectorDBBenchCollection"
 
 # minio
@@ -36,77 +35,63 @@ if __name__ == "__main__":
     env = environs.Env()
     env.read_env(".env")
     dataset_name = env.str("DATASET", "blobs")
-    print(dataset_name)
     data_minio_path = dataset_name + "_npy_data/"
     print(data_minio_path)
 
-    n_rows = 667000000
-    batch_size = 50000000
+    n_rows = 35000000
+    batch_size = 35000000
     dim = 1024
     n_centers = 1024
-    n_parts = 30
+    n_parts = 10
     n_batches = np.ceil(n_rows / batch_size)
+    
+    remote_files = []
 
+    def upload_chunk(x, batch_size, batch, block_id = None):
+        if block_id is not None and x.size != 0:
+            idx = str(batch * batch_size + block_id[0])
+            remote_data_path = "milvus_bulkinsert"
+
+            local_full_path = os.path.join(data_minio_path, idx + ".npy")
+            cupy.save(local_full_path, x, allow_pickle=None)
+
+            try:
+                minio_client = Minio(endpoint=MINIO_ADDRESS, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=False)
+                found = minio_client.bucket_exists(DEFAULT_BUCKET_NAME)
+                if not found:
+                    print("MinIO bucket '{}' doesn't exist. Creating bucket".format(DEFAULT_BUCKET_NAME))
+                    minio_client.make_bucket(DEFAULT_BUCKET_NAME)
+            except S3Error as e:
+                print("Failed to connect MinIO server {}, error: {}".format(MINIO_ADDRESS, e))
+
+            minio_file_path = os.path.join(remote_data_path, idx, "base.npy")
+            minio_client.fput_object(DEFAULT_BUCKET_NAME, minio_file_path, local_full_path)
+
+            remote_files.append(minio_file_path)
+
+        # Remove the temporary file
+        # os.remove(local_full_path)
+        return x
+    
     cluster = LocalCUDACluster(threads_per_worker=1)
     client = Client(cluster)
     workers = list(client.scheduler_info()['workers'].keys())
 
     for batch in range(int(n_batches)):
+        print(batch)
         adjusted_batch_size = min(batch_size, n_rows - batch * batch_size)
         if batch == 0:
-            X, y, centers = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=n_centers, return_centers = True, workers = workers, n_parts = n_parts)            
+            X, y, centers = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=n_centers, return_centers = True, workers = workers, n_parts = n_parts)
         else:
             X, y = cuml.dask.datasets.make_blobs(adjusted_batch_size, dim, centers=centers, workers = workers, n_parts = n_parts)
-        to_npy_stack(data_minio_path + str(batch), X, axis=0)
+        
+        # Iterate over array chunks and upload to MinIO
+        dask.array.map_blocks(upload_chunk, X, batch_size, batch).compute()
 
     client.close()
     cluster.close()
 
     connections.connect(host="localhost", port=19530)
-
-    def upload(data_folder: str,
-            bucket_name: str=DEFAULT_BUCKET_NAME)->(bool, list):
-        if not os.path.exists(data_folder):
-            print("Data path '{}' doesn't exist".format(data_folder))
-            return False, []
-
-        remote_files = []
-
-        try:
-            print("Prepare upload files")
-            minio_client = Minio(endpoint=MINIO_ADDRESS, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=False)
-            found = minio_client.bucket_exists(bucket_name)
-            if not found:
-                print("MinIO bucket '{}' doesn't exist".format(bucket_name))
-                return False, []
-
-            remote_data_path = "milvus_bulkinsert"
-
-            def upload_files(folder:str):
-                for parent, dirnames, filenames in os.walk(folder):
-                    if parent is folder:
-                        for filename in filenames:
-                            ext = os.path.splitext(filename)
-                            if len(ext) != 2 or (ext[1] != ".json" and ext[1] != ".npy"):
-                                continue
-                            local_full_path = os.path.join(parent, filename)
-                            dir = os.path.basename(folder)
-                            idx = str(int(dir) * n_parts + int(ext[0]))
-                            minio_file_path = os.path.join(remote_data_path, idx, "base.npy")
-                            minio_client.fput_object(bucket_name, minio_file_path, local_full_path)
-                            print("Upload file '{}' to '{}'".format(local_full_path, minio_file_path))
-                            remote_files.append(minio_file_path)
-                        for dir in dirnames:
-                            upload_files(os.path.join(parent, dir))
-
-            upload_files(data_folder)
-
-        except S3Error as e:
-            print("Failed to connect MinIO server {}, error: {}".format(MINIO_ADDRESS, e))
-            return False, []
-
-        print("Successfully upload files: {}".format(remote_files))
-        return True, remote_files
 
     print(f"\nList collections...")
     collection_list = list_collections()
@@ -125,10 +110,9 @@ if __name__ == "__main__":
     schema = CollectionSchema(fields)
     coll = Collection(collection_name, schema)
 
-    begin_t = time.time()
-    ok, remote_files = upload(data_folder=data_minio_path)
+    print("remote files to be inserted", remote_files)
 
-    print(remote_files)
+    begin_t = time.time()
 
     print("do_bulk_insert")
     for remote_file in remote_files:
@@ -139,19 +123,22 @@ if __name__ == "__main__":
 
     print("wait insert")
     while True:
-        task = utility.get_bulk_insert_state(task_id=task_id)
-        print("Task state:", task.state_name)
-        print("Imported files:", task.files)
-        print("Collection name:", task.collection_name)
-        print("Partition name:", task.partition_name)
-        print("Start time:", task.create_time_str)
-        print("Imported row count:", task.row_count)
-        print("Entities ID array generated by this task:", task.ids)
-        print("Task failed reason", task.failed_reason)
+        tasks = utility.list_bulk_insert_tasks(collection_name=collection_name)
+        for task in tasks:
+            print(task)
+        # task = utility.get_bulk_insert_state(task_id=task_id)
+        # print("Task state:", task.state_name)
+        # print("Imported files:", task.files)
+        # print("Collection name:", task.collection_name)
+        # print("Partition name:", task.partition_name)
+        # print("Start time:", task.create_time_str)
+        # print("Imported row count:", task.row_count)
+        # print("Entities ID array generated by this task:", task.ids)
+        # print("Task failed reason", task.failed_reason)
 
         print(coll.num_entities)
 
-        if coll.num_entities == n_rows:
+        if coll.num_entities >= n_rows:
             coll.flush()
             break
         time.sleep(1)
